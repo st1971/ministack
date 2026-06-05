@@ -11,6 +11,7 @@ scripts or when Docker is unavailable.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
+import contextvars
 import copy
 import fnmatch
 import json
@@ -724,7 +725,12 @@ def _start_crawler(data):
             }
             logger.info("Glue: Crawler %s finished after %ss", name, CRAWLER_RUN_SECONDS)
 
-    timer = threading.Timer(CRAWLER_RUN_SECONDS, _finish_crawl)
+    # threading.Timer (like threading.Thread) does NOT copy contextvars, so
+    # without this snapshot _finish_crawl runs under the default account and the
+    # account-scoped _crawlers guard never matches — the crawler would hang in
+    # RUNNING forever for non-default accounts. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    timer = threading.Timer(CRAWLER_RUN_SECONDS, lambda: ctx.run(_finish_crawl))
     timer.daemon = True
     timer.start()
 
@@ -844,8 +850,10 @@ def _resolve_script(script_location):
         parts = stripped.split("/", 1)
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
-        # Check on-disk first
-        local_path = os.path.join(S3_DATA_DIR, bucket, key)
+        # Check on-disk first. Objects are persisted account-scoped at
+        # DATA_DIR/<account>/<bucket>/<key> (see s3._object_disk_path), so the
+        # account id MUST be part of the lookup path or it never matches.
+        local_path = os.path.join(S3_DATA_DIR, get_account_id(), bucket, key)
         if os.path.exists(local_path):
             return local_path
         # Fetch from in-memory S3
@@ -934,7 +942,12 @@ def _start_job_run(data):
         run["ExecutionTime"] = int(run["CompletedOn"] - run["StartedOn"])
         run["LastModifiedOn"] = int(time.time())
 
-    thread = threading.Thread(target=_execute, daemon=True)
+    # threading.Thread does NOT copy contextvars, so without this snapshot the
+    # worker would run under the default account and fail to resolve the
+    # account-scoped on-disk script (and AccountScopedDict lookups). Carry the
+    # request's account/region into the thread. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    thread = threading.Thread(target=ctx.run, args=(_execute,), daemon=True)
     thread.start()
 
     return json_response({"JobRunId": run_id})
